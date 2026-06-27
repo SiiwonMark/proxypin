@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 Hongen Wang All rights reserved.
+ * Copyright 2023 Hongen Wang All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,292 +14,244 @@
  * limitations under the License.
  */
 
-import 'dart:collection';
 import 'dart:convert';
+import 'dart:io';
 
-import 'package:proxypin/network/components/interceptor.dart';
-import 'package:proxypin/network/components/manager/request_rewrite_manager.dart';
-import 'package:proxypin/network/http/constants.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:proxypin/network/components/manager/rewrite_rule.dart';
 import 'package:proxypin/network/http/http.dart';
-import 'package:proxypin/network/http/http_headers.dart';
 import 'package:proxypin/network/util/file_read.dart';
 import 'package:proxypin/network/util/logger.dart';
-import 'package:proxypin/network/util/uri.dart';
-import 'package:proxypin/utils/lang.dart';
+import 'package:proxypin/network/util/random.dart';
 
-import 'manager/rewrite_rule.dart';
+/// @author wanghongen
+/// 2023/7/26
+/// 请求重写
+class RequestRewriteManager {
+  static String separator = Platform.pathSeparator;
 
-///  RequestRewriteComponent is a component that can rewrite the request before sending it to the server.
-/// @author Hongen Wang
-class RequestRewriteInterceptor extends Interceptor {
-  static RequestRewriteInterceptor instance = RequestRewriteInterceptor._();
+  //重写规则
+  final Map<RequestRewriteRule, List<RewriteItem>> rewriteItemsCache = {};
 
-  final requestRewriteManager = RequestRewriteManager.instance;
+  //单例
+  static RequestRewriteManager? _instance;
 
-  RequestRewriteInterceptor._();
+  RequestRewriteManager._();
 
-  @override
-  Future<HttpRequest?> onRequest(HttpRequest request) async {
-    //重写请求
-    var url = request.requestUrl;
-    await requestRewrite(url, request);
-    return request;
-  }
-
-  @override
-  Future<HttpResponse?> onResponse(HttpRequest request, HttpResponse response) async {
-    //重写响应
-    try {
-      var url = request.requestUrl;
-      await responseRewrite(url, response);
-    } catch (e, t) {
-      response.body = "$e".codeUnits;
-      logger.e('[${request.requestId}] 响应重写异常 ', error: e, stackTrace: t);
+  static Future<RequestRewriteManager> get instance async {
+    if (_instance == null) {
+      var config = await _loadRequestRewriteConfig();
+      _instance = RequestRewriteManager._();
+      await _instance!.reload(config);
     }
-    return response;
+    return _instance!;
   }
 
-  ///获取重定向
-  Future<String?> getRedirectRule(String? url) async {
-    var manager = await requestRewriteManager;
-    var rewriteRule = manager.getRewriteRule(url, [RuleType.redirect]);
-    if (rewriteRule == null) {
+  bool enabled = true;
+  List<RequestRewriteRule> rules = [];
+
+  //重新加载配置
+  Future<void> reload(Map<String, dynamic>? map) async {
+    rewriteItemsCache.clear();
+    if (map == null) {
+      return;
+    }
+
+    enabled = map['enabled'] == true;
+    List list = map['rules'] ?? [];
+    rules.clear();
+    for (var element in list) {
+      try {
+        rules.add(RequestRewriteRule.formJson(element));
+      } catch (e) {
+        logger.e('加载请求重写配置失败 $element', error: e);
+      }
+    }
+  }
+
+  ///重新加载请求重写
+  Future<void> reloadRequestRewrite() async {
+    var config = await _loadRequestRewriteConfig();
+    reload(config);
+  }
+
+  ///同步配置
+  Future<void> syncConfig(Map<String, dynamic>? config) async {
+    if (config == null) {
+      return;
+    }
+
+    rewriteItemsCache.clear();
+    enabled = config['enabled'] == true;
+    List list = config['rules'] ?? [];
+    rules.clear();
+    for (var element in list) {
+      try {
+        var rule = RequestRewriteRule.formJson(element);
+        List list = element['items'] as List;
+        List<RewriteItem> items = list.map((e) => RewriteItem.fromJson(e)).toList();
+        await addRule(rule, items);
+      } catch (e) {
+        logger.e('加载请求重写配置失败 $element', error: e);
+      }
+    }
+    flushRequestRewriteConfig();
+  }
+
+  /// 加载请求重写配置文件
+  static Future<Map<String, dynamic>?> _loadRequestRewriteConfig() async {
+    var home = await FileRead.homeDir();
+    var file = File('${home.path}${Platform.pathSeparator}request_rewrite.json');
+    var exits = await file.exists();
+    if (!exits) {
+      // 首次运行，从 assets 加载默认配置
+      try {
+        var config = await rootBundle.loadString('assets/1.config');
+        Map<String, dynamic> defaultConfig = jsonDecode(config);
+        logger.i('从 assets 加载默认请求重写配置');
+        return defaultConfig;
+      } catch (e) {
+        logger.e('加载默认配置失败', error: e);
+        return null;
+      }
+    }
+
+    Map<String, dynamic> config = jsonDecode(await file.readAsString());
+    logger.i('加载请求重写配置文件 [$file]');
+    return config;
+  }
+
+  /// 保存请求重写配置文件
+  Future<void> flushRequestRewriteConfig() async {
+    var home = await FileRead.homeDir();
+    var file = File('${home.path}${Platform.pathSeparator}request_rewrite.json');
+    bool exists = await file.exists();
+    if (!exists) {
+      await file.create(recursive: true);
+    }
+    var json = jsonEncode(toJson());
+    logger.i('刷新请求重写配置文件 ${file.path}');
+    await file.writeAsString(json);
+  }
+
+  ///添加规则
+  Future<void> addRule(RequestRewriteRule rule, List<RewriteItem> items) async {
+    final home = await FileRead.homeDir();
+
+    String rewritePath = "${separator}rewrite$separator${RandomUtil.randomString(16)}.json";
+    var file = File(home.path + rewritePath);
+    await file.create(recursive: true);
+    file.writeAsString(jsonEncode(items.map((e) => e.toJson()).toList()));
+    rule.rewritePath = rewritePath;
+
+    rules.add(rule);
+    rewriteItemsCache[rule] = items;
+  }
+
+  ///更新规则
+  Future<void> updateRule(int index, RequestRewriteRule rule, List<RewriteItem>? items) async {
+    rewriteItemsCache.remove(rules[index]);
+    final home = await FileRead.homeDir();
+    rule.updatePathReg();
+    rules[index] = rule;
+
+    if (items == null) {
+      return;
+    }
+    bool isExist = rule.rewritePath != null;
+    if (rule.rewritePath == null) {
+      String rewritePath = "${separator}rewrite$separator${RandomUtil.randomString(16)}.json";
+      rule.rewritePath = rewritePath;
+    }
+
+    File file = File(home.path + rule.rewritePath!);
+    if (!isExist) {
+      await file.create(recursive: true);
+    }
+
+    await file.writeAsString(jsonEncode(items.map((e) => e.toJson()).toList()));
+    rewriteItemsCache[rule] = items;
+  }
+
+  Future<void> removeIndex(List<int> indexes) async {
+    for (var i in indexes) {
+      var rule = rules.removeAt(i);
+      rewriteItemsCache.remove(rule); //删除缓存
+      if (rule.rewritePath != null) {
+        File home = await FileRead.homeDir();
+        try {
+          await File(home.path + rule.rewritePath!).delete();
+        } catch (e) {
+          logger.e('删除请求重写配置文件失败 ${home.path + rule.rewritePath!}', error: e);
+        }
+        rule.rewritePath = null;
+      }
+    }
+  }
+
+  RequestRewriteRule getRequestRewriteRule(HttpRequest request, RuleType type) {
+    var url = request.domainPath;
+    for (var rule in rules) {
+      if (rule.match(url, type: type, method: request.method) && rule.type == type) {
+        return rule;
+      }
+    }
+
+    return RequestRewriteRule(type: type, url: url);
+  }
+
+  RequestRewriteRule? getRewriteRule(String? url, List<RuleType> types) {
+    if (url == null || !enabled) {
+      return null;
+    }
+    for (var rule in rules) {
+      if (rule.match(url) && types.contains(rule.type)) {
+        return rule;
+      }
+    }
+    return null;
+  }
+
+  /// 获取重写规则
+  Future<List<RewriteItem>?> getRewriteItems(RequestRewriteRule rule) async {
+    if (rewriteItemsCache.containsKey(rule)) {
+      return rewriteItemsCache[rule]!;
+    }
+    if (rule.rewritePath == null) {
       return null;
     }
 
-    var rewriteItems = await manager.getRewriteItems(rewriteRule);
-    var redirectUrl = rewriteItems?.firstWhereOrNull((element) => element.enabled)?.redirectUrl;
-    if (rewriteRule.url.contains("*") && redirectUrl?.contains("*") == true) {
-      String ruleUrl = rewriteRule.url.replaceAll("*", "");
-      redirectUrl = redirectUrl?.replaceAll("*", url!.replaceAll(ruleUrl, ""));
+    final home = await FileRead.homeDir();
+    List<RewriteItem> items = [];
+    try {
+      var json = await File(home.path + rule.rewritePath!).readAsString();
+      List? list = jsonDecode(json);
+      list?.forEach((element) => items.add(RewriteItem.fromJson(element)));
+      rewriteItemsCache[rule] = items;
+    } catch (e) {
+      logger.e('加载请求重写配置文件失败 ${home.path + rule.rewritePath!}', error: e);
     }
-    return redirectUrl;
+    return items;
   }
 
-  /// 重写请求
-  Future<void> requestRewrite(String url, HttpRequest request) async {
-    var manager = await RequestRewriteManager.instance;
-    var rewriteRule = manager.getRewriteRule(url, [RuleType.requestReplace, RuleType.requestUpdate]);
-
-    if (rewriteRule?.type == RuleType.requestReplace) {
-      var rewriteItems = await manager.getRewriteItems(rewriteRule!);
-      if (rewriteItems == null) {
-        return;
-      }
-      for (var item in rewriteItems) {
-        if (item.enabled) {
-          await _replaceRequest(request, item);
-        }
-      }
-    }
-
-    if (rewriteRule?.type == RuleType.requestUpdate) {
-      var rewriteItems = await manager.getRewriteItems(rewriteRule!);
-      if (rewriteItems == null) {
-        return;
-      }
-      for (var item in rewriteItems) {
-        if (item.enabled) {
-          await _updateRequest(request, item);
-        }
-      }
-    }
+  Map<String, Object> toJson() {
+    return {
+      'enabled': enabled,
+      'rules': rules.map((e) => e.toJson()).toList(),
+    };
   }
 
-  /// 重写响应
-  Future<bool> responseRewrite(String? url, HttpResponse response) async {
-    var manager = await RequestRewriteManager.instance;
-
-    var rewriteRule = manager.getRewriteRule(url, [RuleType.responseReplace, RuleType.responseUpdate]);
-    if (rewriteRule == null) {
-      return false;
+  Future<Map<String, dynamic>> toFullJson() async {
+    var rulesJson = [];
+    for (var rule in rules) {
+      var json = rule.toJson();
+      json['items'] = await getRewriteItems(rule);
+      rulesJson.add(json);
     }
 
-    if (rewriteRule.type == RuleType.responseReplace) {
-      var rewriteItems = await manager.getRewriteItems(rewriteRule);
-      if (rewriteItems == null) {
-        return false;
-      }
-      for (var item in rewriteItems) {
-        if (item.enabled) {
-          await _replaceResponse(response, item);
-        }
-      }
-      return true;
-    }
-
-    if (rewriteRule.type == RuleType.responseUpdate) {
-      var rewriteItems = await manager.getRewriteItems(rewriteRule);
-      if (rewriteItems == null) {
-        return false;
-      }
-
-      for (var item in rewriteItems) {
-        if (item.enabled) {
-          await _updateMessage(response, item);
-        }
-      }
-      return true;
-    }
-
-    return false;
-  }
-
-  Future<void> _updateRequest(HttpRequest request, RewriteItem item) async {
-    var paramTypes = [RewriteType.addQueryParam, RewriteType.removeQueryParam, RewriteType.updateQueryParam];
-
-    if (paramTypes.contains(item.type)) {
-      var requestUri = request.requestUri;
-      Map<String, dynamic> queryParameters = LinkedHashMap.from(requestUri!.queryParameters);
-
-      switch (item.type) {
-        case RewriteType.addQueryParam:
-          queryParameters[item.key!] = item.value;
-          break;
-        case RewriteType.removeQueryParam:
-          if (item.value?.trim().isNotEmpty == true) {
-            var val = queryParameters[item.key!];
-            if (val == null || !RegExp(item.value!).hasMatch(val)) {
-              break;
-            }
-          }
-          queryParameters.remove(item.key!);
-          break;
-        case RewriteType.updateQueryParam:
-          var itemKey = item.key;
-          if (itemKey == null || itemKey.trim().isEmpty) return;
-
-          var entries = Map.of(queryParameters).entries;
-          var regExp = RegExp(item.key!);
-
-          for (var entry in entries) {
-            var line = "${entry.key}=${entry.value}";
-
-            if (regExp.hasMatch(line)) {
-              line = line.replaceAll(regExp, item.value ?? '');
-              var pair = line.splitFirst(HttpConstants.equal);
-              if (pair.first != entry.key) queryParameters.remove(entry.key);
-
-              queryParameters[pair.first] = pair.length > 1 ? pair.last : '';
-              break;
-            }
-          }
-          break;
-        default:
-          break;
-      }
-      requestUri = requestUri.replace(query: UriUtils.mapToQuery(queryParameters));
-      if (requestUri.isScheme('https')) {
-        request.uri = requestUri.path + (requestUri.hasQuery ? "?${requestUri.query}" : "");
-      } else {
-        request.uri = requestUri.toString();
-      }
-      return;
-    }
-
-    await _updateMessage(request, item);
-  }
-
-  //修改消息
-  Future<void> _updateMessage(HttpMessage message, RewriteItem item) async {
-    if (item.type == RewriteType.updateBody && message.body != null) {
-      String body = (await message.decodeBodyString()).replaceAllMapped(RegExp(item.key!), (match) {
-        if (match.groupCount > 0 && item.value?.contains("\$1") == true) {
-          return item.value!.replaceAll("\$1", match.group(1)!);
-        }
-        return item.value ?? '';
-      });
-
-      message.body = message.charset == 'utf-8' || message.charset == 'utf8' ? utf8.encode(body) : body.codeUnits;
-
-      message.headers.remove(HttpHeaders.CONTENT_ENCODING);
-      message.headers.contentLength = message.body!.length;
-      return;
-    }
-
-    if (item.type == RewriteType.addHeader) {
-      message.headers.set(item.key!, item.value ?? '');
-      return;
-    }
-
-    if (item.type == RewriteType.removeHeader) {
-      if (item.value?.trim().isNotEmpty == true) {
-        var val = message.headers.get(item.key!);
-        if (val == null || !RegExp(item.value!).hasMatch(val)) {
-          return;
-        }
-      }
-      message.headers.remove(item.key!);
-      return;
-    }
-
-    if (item.type == RewriteType.updateHeader) {
-      if (item.key == null || item.key?.trim().isEmpty == true) return;
-
-      var headers = Map.of(message.headers.getHeaders());
-      var regExp = RegExp(item.key!, caseSensitive: false);
-
-      headers.forEach((key, values) {
-        var line = "$key: ${values.firstOrNull ?? ''}";
-        if (regExp.hasMatch(line)) {
-          line = line.replaceAll(regExp, item.value ?? '');
-          var pair = line.splitFirst(HttpConstants.colon);
-          if (pair.first != key) message.headers.remove(key);
-          message.headers.set(pair.first, pair.length > 1 ? pair.last : '');
-        }
-      });
-      return;
-    }
-  }
-
-  //替换请求
-  Future<void> _replaceRequest(HttpRequest request, RewriteItem item) async {
-    if (item.type == RewriteType.replaceRequestLine) {
-      request.method = item.method ?? request.method;
-      Uri uri = Uri.parse(request.requestUrl).replace(path: item.path, query: item.queryParam);
-      if (uri.isScheme('https')) {
-        request.uri = uri.path + (uri.hasQuery ? "?${uri.query}" : "");
-      } else {
-        request.uri = uri.toString();
-      }
-      return;
-    }
-    await _replaceHttpMessage(request, item);
-  }
-
-  //替换相应
-  Future<void> _replaceResponse(HttpResponse response, RewriteItem item) async {
-    if (item.type == RewriteType.replaceResponseStatus && item.statusCode != null) {
-      response.status = HttpStatus.valueOf(item.statusCode!);
-      return;
-    }
-    await _replaceHttpMessage(response, item);
-  }
-
-  Future<void> _replaceHttpMessage(HttpMessage message, RewriteItem item) async {
-    if ((item.type == RewriteType.replaceRequestHeader || item.type == RewriteType.replaceResponseHeader) &&
-        item.headers != null) {
-      item.headers?.forEach((key, value) => message.headers.set(key, value));
-      return;
-    }
-
-    if (item.type == RewriteType.replaceResponseBody || item.type == RewriteType.replaceRequestBody) {
-      if (item.bodyType == ReplaceBodyType.file.name) {
-        if (item.bodyFile == null) return;
-
-        message.body = await FileRead.readFile(item.bodyFile!);
-        message.headers.contentLength = message.body!.length;
-        message.headers.remove(HttpHeaders.CONTENT_ENCODING);
-        return;
-      }
-
-      if (item.body != null) {
-        message.body =
-            message.charset == 'utf-8' || message.charset == 'utf8' ? utf8.encode(item.body!) : item.body?.codeUnits;
-        message.headers.contentLength = message.body!.length;
-        message.headers.remove(HttpHeaders.CONTENT_ENCODING);
-      }
-      return;
-    }
+    return {
+      'enabled': enabled,
+      'rules': rulesJson,
+    };
   }
 }
